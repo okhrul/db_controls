@@ -8,7 +8,6 @@
 #define FC_Motor_Out 7 //FC move motor outwards (motor 2 relay 4)
 
 // Limit switches (1 - not triggered, 0 -triggered)
-// TODO: check after we switched wires
 #define SL_LS_OUT 8 
 #define SL_LS_IN 9 
 #define FC_LS_IN 10 
@@ -30,6 +29,7 @@ float rdAvgVoltage(uint8_t channel = 0, int samples = 10) {
   return ads.computeVolts(avg);
 }
 
+//TODO: recalibrate
 float getSlitPosition(uint8_t channel = 0) {
   float volts = rdAvgVoltage(channel);
   const float minVoltage = 0.29;
@@ -44,7 +44,7 @@ bool limitSwitchHit(String dir) {
     return true;
   }
   if (dir == "OUT" && (!digitalRead(SL_LS_OUT))) {
-    Serial.println("SL Limit switch OIT triggered!");
+    Serial.println("SL Limit switch OUT triggered!");
     return true;
   }
   return false;
@@ -77,7 +77,7 @@ void loop() {
   if (Serial.available()){
     String command = Serial.readStringUntil('\n');
     command.trim();
-    // ================== MOTOR 1 ======================
+    // ================== MOTOR 1 (SLITS) ======================
     // Turn on rotation INWARDS
     if (command == "SL_IN"){
       // if moves outwards, turn it off before moving inwards
@@ -85,7 +85,7 @@ void loop() {
         digitalWrite(SL_Motor_Out, LOW);
       }
       digitalWrite(SL_Motor_In, HIGH);
-      Serial.println("Motor 1: Turn ON rotation INWARDS");
+      Serial.println("SLITS: Turn ON rotation INWARDS");
     }
     // Turn on rotation OUTWARDS
     else if (command == "SL_OUT"){
@@ -94,15 +94,15 @@ void loop() {
         digitalWrite(SL_Motor_In, LOW);
       }
       digitalWrite(SL_Motor_Out, HIGH);
-      Serial.println("Motor 1: Turn ON rotation OUTWARDS");
+      Serial.println("SLITS: Turn ON rotation OUTWARDS");
     }
     // Turn off rotation in any direction
     else if (command == "SL_STOP"){
       digitalWrite(SL_Motor_In, LOW);
       digitalWrite(SL_Motor_Out, LOW);
-      Serial.println("Motor 1: Turn OFF rotation OUTWARDS");
+      Serial.println("SLITS: Turn OFF rotation");
     }
-    // ================== MOTOR 2 ======================
+    // ================== MOTOR 2 (FC) ======================
     // Turn on rotation INWARDS
     else if (command == "FC_IN"){
       // if moves outwards, turn it off before moving inwards
@@ -110,7 +110,7 @@ void loop() {
         digitalWrite(FC_Motor_Out, LOW);
       }
       digitalWrite(FC_Motor_In, HIGH);
-      Serial.println("Motor 2: Turn ON rotation INWARDS");
+      Serial.println("FC: Turn ON rotation INWARDS");
     }
     // Turn on rotation OUTWARDS
     else if (command == "FC_OUT"){
@@ -119,13 +119,13 @@ void loop() {
         digitalWrite(FC_Motor_In, LOW);
       }
       digitalWrite(FC_Motor_Out, HIGH);
-      Serial.println("Motor 2: Turn ON rotation OUTWARDS");
+      Serial.println("FC: Turn ON rotation OUTWARDS");
     }
     // Turn off rotation in any direction
     else if (command == "FC_STOP"){
       digitalWrite(FC_Motor_In, LOW);
       digitalWrite(FC_Motor_Out, LOW);
-      Serial.println("Motor 2: Turn OFF rotation OUTWARDS");
+      Serial.println("FC: Turn OFF rotation");
     }
 
     // ========= Move IN by a certain value x (mm) ==============
@@ -183,7 +183,7 @@ void loop() {
 
   float pos = getSlitPosition(); 
   
-  Serial.print(pos,2); Serial.println("mm");
+  //Serial.print(pos,2); Serial.println("mm");
  //slits down 4.24V
  //slits up 0.29V 10.2mm
 
@@ -196,7 +196,7 @@ void loop() {
                    ";&SL:" + String(read_SL_LS_IN) + ";" + String(read_SL_LS_OUT) +
                    ";" + String(pos) + "&";
   Serial.println(message);
-  delay(1000);
+  delay(100);
 }
 
 
@@ -242,7 +242,7 @@ void moveInBy(float x, String dir){
     if (Serial.available()) {
       String input = Serial.readStringUntil('\n');
       input.trim();
-      if (input == "STOP") {
+      if (input == "SL_STOP") {
         Serial.println("Movement interrupted by STOP command.");
         break;
       }
