@@ -17,6 +17,22 @@
 Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
 
 const float rangeDistance = 130.6-10.2; // slis range
+
+// ======================== State Variables ==================
+enum MovementState {
+  IDLE,
+  MOVING_IN,
+  MOVING_OUT
+};
+
+MovementState slState = IDLE;
+MovementState fcState = IDLE;
+
+float slStartPos = 0;
+float slTargetPos = 0;
+bool movingToTarget = false;
+
+
 // ======================== Helper functions ================
 
 float rdAvgVoltage(uint8_t channel = 0, int samples = 10) {
@@ -37,26 +53,87 @@ float getSlitPosition(uint8_t channel = 0) {
   return (volts - minVoltage) * rangeDistance / (maxVoltage - minVoltage);
 }
 
+void stopSlMovement() {
+  digitalWrite(SL_Motor_In, LOW);
+  digitalWrite(SL_Motor_Out, LOW);
+  slState = IDLE;
+  movingToTarget = false;
+}
+
+void stopFcMovement() {
+  digitalWrite(FC_Motor_In, LOW);
+  digitalWrite(FC_Motor_Out, LOW);
+  fcState = IDLE;
+}
+
 //Check if movement should stop due to limit switch
-bool limitSwitchHit(String dir) {
-  if (dir == "IN" && (!digitalRead(SL_LS_IN))) {
-    Serial.println("SL Limit switch IN triggered!");
+bool checkLimitSwitches() {
+  // Check SLITS limit switches
+  if (slState == MOVING_IN && !digitalRead(SL_LS_IN)) {
+    Serial.println("SLITS: Limit switch IN triggered!");
+    stopSlMovement();
     return true;
   }
-  if (dir == "OUT" && (!digitalRead(SL_LS_OUT))) {
-    Serial.println("SL Limit switch OUT triggered!");
+  if (slState == MOVING_OUT && !digitalRead(SL_LS_OUT)) {
+    Serial.println("SLITS: Limit switch OUT triggered!");
+    stopSlMovement();
     return true;
   }
+
+  // Check FC limit switches
+  if (fcState == MOVING_IN && !digitalRead(FC_LS_IN)) {
+    Serial.println("FC: Limit switch IN triggered!");
+    stopFcMovement();
+    return true;
+  }
+  if (fcState == MOVING_OUT && !digitalRead(FC_LS_OUT)) {
+    Serial.println("FC: Limit switch OUT triggered!");
+    stopFcMovement();
+    return true;
+  }
+
   return false;
 }
+
+void sendStatusMessage() {
+  float pos = getSlitPosition(); 
+  bool read_FC_LS_IN = !digitalRead(FC_LS_IN);
+  bool read_FC_LS_OUT = !digitalRead(FC_LS_OUT);
+  bool read_SL_LS_IN = !digitalRead(SL_LS_IN);
+  bool read_SL_LS_OUT = !digitalRead(SL_LS_OUT);
+  
+  String message = "&FC:" + String(read_FC_LS_IN) + ";" + String(read_FC_LS_OUT) +
+                   ";&SL:" + String(read_SL_LS_IN) + ";" + String(read_SL_LS_OUT) +
+                   ";" + String(pos) + "&";
+  Serial.println(message);
+}
+
+void updatePositionMovement() {
+  if (!movingToTarget) return;
+  
+  // unsigned long currentTime = millis();
+  // if (currentTime - lastPositionCheck < positionCheckInterval) return;
+  // lastPositionCheck = currentTime;
+
+  float currPos = getSlitPosition();
+  
+  // Check if target reached
+  if ((slState == MOVING_IN && currPos >= slTargetPos) ||
+      (slState == MOVING_OUT && currPos <= slTargetPos)) {
+    Serial.print("Target reached. Final position: ");
+    Serial.println(currPos);
+    stopSlMovement();
+  }
+}
+
+
+
 
 // ========================= MAIN PART ========================
 
 void setup() {
   Serial.begin(38400);
 
-  Serial.println("Getting single-ended readings from AIN0..3");
-  Serial.println("ADC Range: +/- 6.144V (1 bit = 3mV/ADS1015, 0.1875mV/ADS1115)");
   ads.setGain(GAIN_TWOTHIRDS);  // 2/3x gain +/- 6.144V  1 bit = 0.1875mV (default)
   if (!ads.begin()) {
     Serial.println("Failed to initialize ADS.");
@@ -84,6 +161,8 @@ void loop() {
       if (digitalRead(SL_Motor_Out)){
         digitalWrite(SL_Motor_Out, LOW);
       }
+      slState = MOVING_IN;
+      movingToTarget = false;
       digitalWrite(SL_Motor_In, HIGH);
       Serial.println("SLITS: Turn ON rotation INWARDS");
     }
@@ -93,13 +172,14 @@ void loop() {
       if (digitalRead(SL_Motor_In)){
         digitalWrite(SL_Motor_In, LOW);
       }
+      slState = MOVING_OUT;
+      movingToTarget = false;
       digitalWrite(SL_Motor_Out, HIGH);
       Serial.println("SLITS: Turn ON rotation OUTWARDS");
     }
     // Turn off rotation in any direction
     else if (command == "SL_STOP"){
-      digitalWrite(SL_Motor_In, LOW);
-      digitalWrite(SL_Motor_Out, LOW);
+      stopSlMovement();
       Serial.println("SLITS: Turn OFF rotation");
     }
     // ================== MOTOR 2 (FC) ======================
@@ -109,6 +189,7 @@ void loop() {
       if (digitalRead(FC_Motor_Out)){
         digitalWrite(FC_Motor_Out, LOW);
       }
+      fcState = MOVING_IN;
       digitalWrite(FC_Motor_In, HIGH);
       Serial.println("FC: Turn ON rotation INWARDS");
     }
@@ -118,24 +199,30 @@ void loop() {
       if (digitalRead(FC_Motor_In)){
         digitalWrite(FC_Motor_In, LOW);
       }
+      fcState = MOVING_OUT;
       digitalWrite(FC_Motor_Out, HIGH);
       Serial.println("FC: Turn ON rotation OUTWARDS");
     }
     // Turn off rotation in any direction
     else if (command == "FC_STOP"){
-      digitalWrite(FC_Motor_In, LOW);
-      digitalWrite(FC_Motor_Out, LOW);
+      stopFcMovement();
       Serial.println("FC: Turn OFF rotation");
     }
 
     // ========= Move IN by a certain value x (mm) ==============
-    // TODO: avoid loopong in moveInBy 
     else if (command.startsWith("SL_IN_BY#")) {
       // doesn't check if we entered a number...
       float x = command.substring(9).toFloat();
       Serial.print("Moving IN by ");
       Serial.println(x);
-      moveInBy(x, "IN");
+      // Stop any current movement
+      stopSlMovement();
+      
+      slStartPos = getSlitPosition();
+      slTargetPos = slStartPos + x;
+      digitalWrite(SL_Motor_In, HIGH);
+      slState = MOVING_IN;
+      movingToTarget = true;
     }
      // Move OUT by a certain value x (mm)
     else if (command.startsWith("SL_OUT_BY#")) {
@@ -143,118 +230,27 @@ void loop() {
       float x = command.substring(10).toFloat();
       Serial.print("Moving OUT by ");
       Serial.println(x);
-      moveInBy(x, "OUT");
+      // Stop any current movement
+      stopSlMovement();
+      
+      slStartPos = getSlitPosition();
+      slTargetPos = slStartPos - x;
+      digitalWrite(SL_Motor_Out, HIGH);
+      slState = MOVING_OUT;
+      movingToTarget = true;
     }
     // If unknown command stop everything
     else{
       Serial.print("Unknown command. Stopping... Command: ");
       Serial.println(command);
-      digitalWrite(SL_Motor_In, LOW);
-      digitalWrite(SL_Motor_Out, LOW);
+      stopSlMovement();
+      stopFcMovement();
     }
   }
 
+  checkLimitSwitches();
+  updatePositionMovement();
+  sendStatusMessage();
 
-  //========== LIMITS SWITCHES ==============
-  if ((!digitalRead(SL_LS_OUT)) && digitalRead(SL_Motor_Out)){
-    digitalWrite(SL_Motor_Out, LOW);
-    Serial.println("Movement stopped due to limit switch.");
-  }  
-  if ((!digitalRead(SL_LS_IN)) && digitalRead(SL_Motor_In)){
-    digitalWrite(SL_Motor_In, LOW);
-    Serial.println("Movement stopped due to limit switch.");
-  }  
-  if ((!digitalRead(FC_LS_OUT)) && digitalRead(FC_Motor_Out)){
-    digitalWrite(FC_Motor_Out, LOW);
-    Serial.println("Movement stopped due to limit switch.");
-  }  
-  if ((!digitalRead(FC_LS_IN)) && digitalRead(FC_Motor_In)){
-    digitalWrite(FC_Motor_In, LOW);
-    Serial.println("Movement stopped due to limit switch.");
-  }  
-
-
-
-  // ============= SEND INFO ==================================
-
-  //Serial.print("FC_LS_IN "); Serial.print(digitalRead(FC_LS_IN)); Serial.print(" FC_LS_OUT "); Serial.println(digitalRead(FC_LS_OUT));
-  //Serial.print("SL_LS_IN "); Serial.print(digitalRead(SL_LS_IN)); Serial.print(" SL_LS_OUT "); Serial.println(digitalRead(SL_LS_OUT));
-
-
-  float pos = getSlitPosition(); 
-  
-  //Serial.print(pos,2); Serial.println("mm");
- //slits down 4.24V
- //slits up 0.29V 10.2mm
-
-  bool read_FC_LS_IN = !digitalRead(FC_LS_IN);
-  bool read_FC_LS_OUT = !digitalRead(FC_LS_OUT);
-  bool read_SL_LS_IN = !digitalRead(SL_LS_IN);
-  bool read_SL_LS_OUT = !digitalRead(SL_LS_OUT);
-  // limit in, out, pos "&FC:0;0;&SL:0;0;pos&"
-  String message = "&FC:" + String(read_FC_LS_IN) + ";" + String(read_FC_LS_OUT) +
-                   ";&SL:" + String(read_SL_LS_IN) + ";" + String(read_SL_LS_OUT) +
-                   ";" + String(pos) + "&";
-  Serial.println(message);
   delay(100);
-}
-
-
-
-void moveInBy(float x, String dir){
-
-  // Stop all motors before starting 
-  digitalWrite(SL_Motor_In, LOW);
-  digitalWrite(SL_Motor_Out, LOW);
-
-  float startPos = getSlitPosition();
-  float targetPos;
-  Serial.print("Initial position: ");
-  Serial.println(startPos);
-
-  if (dir=="IN"){
-    targetPos = startPos + x; //moving in -> x increases
-    digitalWrite(SL_Motor_In, HIGH);
-  }
-  else if (dir == "OUT"){
-    targetPos = startPos - x;
-    digitalWrite(SL_Motor_Out, HIGH);
-  }
-  else{
-    Serial.println("Provided Invalid movement direction");
-    return;
-  }
-
-  Serial.print("Starting move ");  Serial.print(dir);  Serial.print(" from ");
-  Serial.print(startPos);  Serial.print(" mm to ");  Serial.print(targetPos);  Serial.println(" mm");
-
-  while (true) {
-    float currPos = getSlitPosition();
-    Serial.println(currPos);
-    // Check if target reached
-    if ((dir == "IN" && currPos >= targetPos) ||
-        (dir == "OUT" && currPos <= targetPos)) {
-      Serial.println("Target reached.");
-      break;
-    }
-
-    // Check for STOP command
-    if (Serial.available()) {
-      String input = Serial.readStringUntil('\n');
-      input.trim();
-      if (input == "SL_STOP") {
-        Serial.println("Movement interrupted by STOP command.");
-        break;
-      }
-    }
-    // Limit switch check
-    if (limitSwitchHit(dir)) {
-      Serial.println("Movement stopped due to limit switch.");
-      break;
-    }
-    delay(10); 
-  }
-  // Stop motors
-  digitalWrite(SL_Motor_In, LOW);
-  digitalWrite(SL_Motor_Out, LOW);
 }
