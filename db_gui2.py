@@ -125,8 +125,7 @@ class ConnectionDialog(QDialog):
         # Port selection
         layout.addWidget(QLabel("Select COM Port:"))
         self.port_combo = QComboBox()
-        for desc, device in self.list_serial_ports():
-            self.port_combo.addItem(desc, device)
+        self._populate_serial_ports()
         layout.addWidget(self.port_combo)
 
         # Baudrate selection
@@ -145,31 +144,76 @@ class ConnectionDialog(QDialog):
 
         self.setLayout(layout)
 
+    def _populate_serial_ports(self) -> None:
+        """Populate the COM port dropdown with available ports."""
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            self.port_combo.addItem("No ports found", None)
+            return
+        for port in sorted(ports, key=lambda p: p.device):
+            self.port_combo.addItem(port.description, port.device)
+
     def get_selection(self):
+        """Get the user's port and baud rate selection.
+
+        Returns:
+            tuple: (port_name, baud_rate) where port_name may be None if no port selected
+        """
         return self.port_combo.currentData(), self.baud_combo.currentText()
 
-    def list_serial_ports(self):
-        return [
-            (port.description, port.device)
-            for port in serial.tools.list_ports.comports()
-        ]
 
+class KeithleyController:
+    """Controller for Keithley picoammeter communication."""
 
-def setup_keithley(address="GPIB0::14::INSTR"):
-    """Initialize Keithley picoammeter"""
-    rm = pyvisa.ResourceManager()
-    print("Setting up ampermeter")
-    try:
-        keithley = rm.open_resource(address)
-        keithley.timeout = 1000
-        keithley.write("*RST")
-        keithley.write("SYST:ZCH OFF")  # Turn off zero check
-        keithley.write(":SENS:FUNC 'CURR'")  # Do I need it?
-        keithley.write("CURR:NPLC 1")  # faster reading
-        return keithley
-    except Exception as e:
-        print(f"Failed to setup Keithley: {str(e)}")
-        return None
+    def __init__(self):
+        self._resource = None
+        self._rm = pyvisa.ResourceManager()
+
+    def connect(self, address: str = "GPIB0::14::INSTR") -> bool:
+        """Initialize connection to Keithley picoammeter.
+
+        Args:
+            address: VISA resource address
+
+        Returns:
+            bool: True if connection was successful
+        """
+        try:
+            if self._resource:
+                self.disconnect()
+
+            self._resource = self._rm.open_resource(address)
+            self._resource.timeout = 1000
+            self._resource.write("*RST")
+            self._resource.write("SYST:ZCH OFF")  # Turn off zero check
+            self._resource.write(":SENS:FUNC 'CURR'")
+            self._resource.write("CURR:NPLC 1")  # Faster reading
+            return True
+        except Exception as e:
+            print(f"Failed to setup Keithley: {str(e)}")
+            return False
+
+    def disconnect(self) -> None:
+        """Close the connection to the Keithley."""
+        if self._resource:
+            self._resource.close()
+            self._resource = None
+
+    def read_current(self) -> Optional[float]:
+        """Read current measurement from Keithley.
+
+        Returns:
+            float: Current reading in amperes, or None if read failed
+        """
+        if not self._resource:
+            return None
+
+        try:
+            return float(self._resource.query(":READ?").split(",")[0].strip())
+        except Exception as e:
+            print(f"Keithley read error: {str(e)}")
+            return None
 
 
 class DB_Main_Window(QMainWindow):
