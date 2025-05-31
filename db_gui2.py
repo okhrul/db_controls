@@ -53,6 +53,7 @@ class SerialThread(QThread):
             with self._lock:
                 self.ser = serial.Serial(port_name, baud_rate, timeout=1)
                 self._is_running = True
+                print("Set up serial, _is_running_=True")
             return True
         except serial.SerialException as e:
             self.error_occurred.emit(f"Error opening serial port: {e}")
@@ -60,7 +61,7 @@ class SerialThread(QThread):
 
     def run(self):
         """Main thread loop for handling serial communication."""
-        while self.is_running and self.ser and self.ser.is_open:
+        while self._is_running and self.ser and self.ser.is_open:
             with self._lock:
                 # Handle writing
                 while not self._write_queue.empty():
@@ -219,260 +220,328 @@ class KeithleyController:
 class DB_Main_Window(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        # Load UI file created for QWidget into the central widget of QMainWindow
         uic.loadUi("db_gui2.ui", self)
-        # self.setFixedSize(central_widget.size())
-
         self.SL_pos_field.setToolTip("0 mm - OUT, 123 mm - IN")
-        # self.plotWidget = pg.PlotWidget()
-        self.plotWidget.setBackground("w")
-        self.plotWidget.clear()
-        pen = pg.mkPen(color=(0, 0, 255), width=1)
-        time = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        temperature = [30, 32, 34, 32, 33, 31, 29, 32, 35, 45]
-        self.plotWidget.plot(
-            time, temperature, symbol="o", symbolSize=6, symbolBrush="b", pen=pen
-        )
-        self.plotWidget.setLabel("left", "Current (A)")
-        self.plotWidget.setLabel("bottom", "Slit position (mm)")
+        self._init_menu_bar()
+        self._init_components()
+        self._setup_functions()
+        self._init_scan_state()
 
-        # Serial thread setup
+    # def _setup_plot(self) -> None:
+    #     """Configure the initial plot settings."""
+    #     self.plotWidget.setBackground("w")
+    #     self.plotWidget.clear()
+    #     pen = pg.mkPen(color=(0, 0, 255), width=1)
+    #     time_data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    #     temperature_data = [30, 32, 34, 32, 33, 31, 29, 32, 35, 45]
+    #     self.plotWidget.plot(
+    #         time_data, temperature_data,
+    #         symbol="o", symbolSize=6, symbolBrush="b", pen=pen
+    #     )
+    #     self.plotWidget.setLabel("left", "Current (A)")
+    #     self.plotWidget.setLabel("bottom", "Slit position (mm)")
+
+    def _init_components(self) -> None:
+        """Initialize thread and ampermeter"""
         self.serial_thread = SerialThread(self)
-        self.serial_thread.received_data.connect(self.update_received_data)
-        self.serial_thread.error_occurred.connect(self.log_message)
+        self.serial_thread.received_data.connect(self._handle_received_data)
+        self.serial_thread.error_occurred.connect(self._log_message)
 
-        # Setup menu bar
-        self.init_menu_bar()
+        self.keithley = KeithleyController()
 
-        # Connect control buttons
-        self.FC_In_Btn.clicked.connect(lambda: self.send_serial_command("FC_IN\n"))
-        self.FC_Out_Btn.clicked.connect(lambda: self.send_serial_command("FC_OUT\n"))
-        self.FC_Stop_Btn.clicked.connect(lambda: self.send_serial_command("FC_STOP\n"))
-        self.SL_In_Btn.clicked.connect(lambda: self.send_serial_command("SL_IN\n"))
-        self.SL_Out_Btn.clicked.connect(lambda: self.send_serial_command("SL_OUT\n"))
-        self.SL_Stop_Btn.clicked.connect(lambda: self.send_serial_command("SL_STOP\n"))
-        self.mvto_field.returnPressed.connect(self.send_mvto)
-        self.mvby_field.returnPressed.connect(self.send_mvby)
+    def _init_menu_bar(self) -> None:
+        """Initialize the menu bar."""
+        menubar = self.menuBar()
+        conn_menu = menubar.addMenu("Connection")
 
-        # Scan state
+        # Arduino connection actions
+        connect_action = QAction("Connect to Arduino", self)
+        connect_action.triggered.connect(self._show_connection_dialog)
+        conn_menu.addAction(connect_action)
+
+        self.disconnect_action = QAction("Disconnect", self)
+        self.disconnect_action.triggered.connect(self._disconnect_serial)
+        self.disconnect_action.setEnabled(False)
+        conn_menu.addAction(self.disconnect_action)
+
+        conn_menu.addSeparator()
+
+        # Keithley connection actions
+        connect_keithley_action = QAction("Connect to Keithley", self)
+        connect_keithley_action.triggered.connect(self._connect_keithley)
+        conn_menu.addAction(connect_keithley_action)
+
+    def _setup_functions(self) -> None:
+        """Setup function connections for UI elements."""
+        # Control buttons
+        self.FC_In_Btn.clicked.connect(lambda: self._send_serial_command("FC_IN\n"))
+        self.FC_Out_Btn.clicked.connect(lambda: self._send_serial_command("FC_OUT\n"))
+        self.FC_Stop_Btn.clicked.connect(lambda: self._send_serial_command("FC_STOP\n"))
+        self.SL_In_Btn.clicked.connect(lambda: self._send_serial_command("SL_IN\n"))
+        self.SL_Out_Btn.clicked.connect(lambda: self._send_serial_command("SL_OUT\n"))
+        self.SL_Stop_Btn.clicked.connect(lambda: self._send_serial_command("SL_STOP\n"))
+
+        # Movement fields
+        self.mvto_field.returnPressed.connect(self._send_move_to)
+        self.mvby_field.returnPressed.connect(self._send_move_by)
+
+        # Scan buttons
+        self.hStartScanBtn.clicked.connect(
+            lambda: self._run_scan(self.hStartPosField, self.hEndPosField)
+        )
+        self.hStopScanBtn.clicked.connect(self._cleanup_scan)
+        self.vStartScanBtn.clicked.connect(
+            lambda: self._run_scan(self.vStartPosField, self.vEndPosField)
+        )
+        self.vStopScanBtn.clicked.connect(self._cleanup_scan)
+
+        # Data saving
+        self.saveBtn.clicked.connect(self._save_scan_data)
+
+    def _init_scan_state(self) -> None:
+        """Initialize variables related to scanning."""
         self.scan_data = []
         self.is_scanning = False
         self._scan_interrupt = False
         self._scan_position = None  # Shared position for scan routine
-        self._scan_sl_status = None  # track SL status
+        self._scan_sl_status = None  # Track SL status
         self._pos_reached_event = threading.Event()
         self._ack_event = threading.Event()
 
-        self.hStartScanBtn.clicked.connect(
-            lambda: self.run_scan(self.hStartPosField, self.hEndPosField)
-        )
-        self.hStopScanBtn.clicked.connect(self.scan_cleanup)
-        self.vStartScanBtn.clicked.connect(
-            lambda: self.run_scan(self.vStartPosField, self.vEndPosField)
-        )
-        self.vStopScanBtn.clicked.connect(self.scan_cleanup)
-
-        self.saveBtn.clicked.connect(self.save_scan_data)
-
-    # ================ Connection ======================
-    def init_menu_bar(self):
-        menubar = self.menuBar()
-        conn_menu = menubar.addMenu("Connection")
-
-        connect_action = QAction("Connect to Arduino", self)
-        connect_action.triggered.connect(self.show_connection_dialog)
-        conn_menu.addAction(connect_action)
-
-        self.disconnect_action = QAction(
-            "Disconnect", self
-        )  # Store as instance variable
-        self.disconnect_action.triggered.connect(self.disconnect_serial)
-        self.disconnect_action.setEnabled(False)  # Initially disabled
-        conn_menu.addAction(self.disconnect_action)
-
-        conn_menu.addSeparator()  # <-- Divider between Arduino and Keithley
-
-        connect_keithley_action = QAction("Connect to Keithley", self)
-        connect_keithley_action.triggered.connect(self.connect_keithley_dialog)
-        conn_menu.addAction(connect_keithley_action)
-
-    def show_connection_dialog(self):
+    # Serial connection methods
+    def _show_connection_dialog(self) -> None:
+        """Show the serial port connection dialog."""
         dialog = ConnectionDialog(self)
         if dialog.exec_():
             port, baud = dialog.get_selection()
-            self.connect_serial(port, baud)
+            self._connect_serial(port, baud)
 
-    def connect_serial(self, port, baud):
-        if not port or not baud:
-            self.log_message("Missing port or baudrate.")
+    def _connect_serial(self, port: str, baud: str) -> None:
+        """Connect to the specified serial port.
+
+        Args:
+            port: Serial port name
+            baud: Baud rate as string
+        """
+        if not port:
+            self._log_message("No port selected.")
             return
+
         try:
-            self.serial_thread.setup_port(port, baud)
-            if self.serial_thread.ser and self.serial_thread.ser.is_open:
-                self.serial_thread.start()
-                self.log_message(f"Connected to {port}.")
-                self.disconnect_action.setEnabled(True)  # Enable on connect
-            else:
-                self.log_message(f"Failed to connect to {port}. Port might be in use.")
-                self.disconnect_action.setEnabled(False)
-        except Exception as e:
-            self.log_message(f"Error opening serial port: {e}")
+            baud_rate = int(baud)
+        except ValueError:
+            self._log_message(f"Invalid baud rate: {baud}")
+            return
+
+        if self.serial_thread.setup_port(port, baud_rate):
+            self.serial_thread.start()
+            self._log_message(f"Connected to {port}.")
+            self.disconnect_action.setEnabled(True)
+        else:
+            self._log_message(f"Failed to connect to {port}.")
             self.disconnect_action.setEnabled(False)
 
-    def disconnect_serial(self):
-        if self.serial_thread.is_running:
-            self.serial_thread.stop()
-            self.log_message("Disconnected from serial port.")
-        self.disconnect_action.setEnabled(False)  # Disable on disconnect
+    def _disconnect_serial(self) -> None:
+        """Disconnect from the serial port."""
+        self.serial_thread.stop()
+        self._log_message("Disconnected from serial port.")
+        self.disconnect_action.setEnabled(False)
 
-    def connect_keithley_dialog(self):
-        # For simplicity, just use default address. You can expand this to a dialog if needed.
-        self.keithley = setup_keithley()
-        if self.keithley is not None:
-            self.log_message("Keithley connected successfully.")
+    def _connect_keithley(self) -> None:
+        """Connect to the Keithley picoammeter."""
+        if self.keithley.connect():
+            self._log_message("Keithley connected successfully.")
         else:
-            self.log_message("Failed to connect to Keithley.")
+            self._log_message("Failed to connect to Keithley.")
 
-    # ================= Communication with arduino ================
+    # =========== Communication with arduino ================
+    def _send_serial_command(self, command: str) -> None:
+        """Send a command to the Arduino via serial.
 
-    @pyqtSlot(str)
-    def send_serial_command(self, command):
-        if self.serial_thread.is_running:
-            try:
-                self.serial_thread.write_data(command)
-                self.log_message(f"Sent: {command.strip()}")
-            except Exception as e:
-                self.log_message(str(e))
+        Args:
+            command: The command string to send
+        """
+        if not self.serial_thread.isRunning():
+            self._log_message("Error: Not connected to COM port!")
+            return
+
+        if self.serial_thread.write_data(command):
+            self._log_message(f"Sent: {command.strip()}")
         else:
-            self.log_message("Error: Not connected to COM port!")
+            self._log_message("Failed to send command.")
 
-    @pyqtSlot()
-    def send_mvto(self):
-        if self.serial_thread.is_running:
-            try:
-                pos = float(self.mvto_field.text())
-                self.send_serial_command(f"SL_TO#{pos}")
-            except ValueError:
-                self.log_message("Position must be a number!")
-        else:
-            self.log_message("Error: Not connected to COM port!")
+    def _send_move_to(self) -> None:
+        """Handle move-to command from the UI."""
+        if not self.serial_thread.isRunning():
+            self._log_message("Error: Not connected to COM port!")
+            return
+        try:
+            pos = float(self.mvto_field.text())
+            self._send_serial_command(f"SL_TO#{pos}")
+        except ValueError:
+            self._log_message("Position must be a number!")
 
-    @pyqtSlot()
-    def send_mvby(self):
-        if self.serial_thread.is_running:
-            try:
-                val = float(self.mvby_field.text())
-                if val > 0:
-                    self.send_serial_command(f"SL_IN_BY#{val}")
-                elif val < 0:
-                    self.send_serial_command(f"SL_OUT_BY#{abs(val)}")
-            except ValueError:
-                self.log_message("Distance must be a number!")
-        else:
-            self.log_message("Error: Not connected to COM port!")
+    def _send_move_by(self) -> None:
+        """Handle move-by command from the UI."""
+        if not self.serial_thread.isRunning():
+            self._log_message("Error: Not connected to COM port!")
+            return
+        try:
+            val = float(self.mvby_field.text())
+            if val > 0:
+                self._send_serial_command(f"SL_IN_BY#{val}")
+            elif val < 0:
+                self._send_serial_command(f"SL_OUT_BY#{abs(val)}")
+        except ValueError:
+            self._log_message("Distance must be a number!")
 
     # ================== Displaying data ================
+    def _handle_received_data(self, data: str) -> None:
+        """Process data received from the Arduino.
 
-    @pyqtSlot(str)
-    def update_received_data(self, data):
+        Args:
+            data: The received data string
+        """
         if data.startswith("&FC"):
-            try:
-                fc_status = data.split("&")[1].split(":")[1]
-                sl_status = data.split("&")[2].split(":")[1]
-                fc_ls_in, fc_ls_out, fc_state, _ = fc_status.split(";")
-                sl_ls_in, sl_ls_out, sl_state, pos = sl_status.split(";")
-                self._scan_position = float(pos)
-                self._scan_sl_status = sl_state
-
-                # Check if waiting for position
-                if hasattr(self, "_target_position"):
-                    if (
-                        abs(self._scan_position - self._target_position) < 0.5
-                        and self._scan_sl_status == "0"
-                    ):
-                        if hasattr(self, "_pos_reached_event"):
-                            self._pos_reached_event.set()
-            except:
-                self.log_message(f"Unknown status format: {data}")
-                return
-
-            self.FC_LS_IN_status.setStyleSheet(
-                "background-color: red; border-radius: 10px;"
-                if fc_ls_in == "1"
-                else "background-color: grey; border-radius: 10px;"
-            )
-
-            self.FC_LS_OUT_status.setStyleSheet(
-                "background-color: red; border-radius: 10px;"
-                if fc_ls_out == "1"
-                else "background-color: grey; border-radius: 10px;"
-            )
-            self.SL_LS_IN_status.setStyleSheet(
-                "background-color: red; border-radius: 10px;"
-                if sl_ls_in == "1"
-                else "background-color: grey; border-radius: 10px;"
-            )
-            self.SL_LS_OUT_status.setStyleSheet(
-                "background-color: red; border-radius: 10px;"
-                if sl_ls_out == "1"
-                else "background-color: grey; border-radius: 10px;"
-            )
-            self.SL_pos_field.setText(f"{pos} mm")
-        elif (
-            "ACK" in data
-        ):  # mostly for scan routine, to collect data only after the movement has started
+            self._process_status_data(data)
+        elif "ACK" in data:
             self._ack_event.set()
         else:
-            self.log_message(data)
+            self._log_message(data)
 
-    @pyqtSlot(str)
-    def log_message(self, message):
+    def _process_status_data(self, data: str) -> None:
+        """Process status update data from Arduino.
+
+        Args:
+            data: The status data string
+        """
+        try:
+            parts = data.split("&")
+            fc_status = parts[1].split(":")[1]
+            sl_status = parts[2].split(":")[1]
+
+            fc_ls_in, fc_ls_out, fc_state, _ = fc_status.split(";")
+            sl_ls_in, sl_ls_out, sl_state, pos = sl_status.split(";")
+
+            self._scan_position = float(pos)
+            self._scan_sl_status = sl_state
+
+            # Update position reached event if waiting
+            if hasattr(self, "_target_position"):
+                if (
+                    abs(self._scan_position - self._target_position) < 0.5
+                    and self._scan_sl_status == "0"
+                ):
+                    if hasattr(self, "_pos_reached_event"):
+                        self._pos_reached_event.set()
+
+            # Update status indicators
+            self._update_status_indicators(
+                fc_ls_in, fc_ls_out, sl_ls_in, sl_ls_out, pos
+            )
+        except Exception as e:
+            self._log_message(f"Error parsing status data: {e}")
+
+    def _update_status_indicators(
+        self, fc_ls_in: str, fc_ls_out: str, sl_ls_in: str, sl_ls_out: str, pos: str
+    ) -> None:
+        """Update the status indicator LEDs and position display.
+
+        Args:
+            fc_ls_in: FC limit switch in status
+            fc_ls_out: FC limit switch out status
+            sl_ls_in: SL limit switch in status
+            sl_ls_out: SL limit switch out status
+            pos: Current position
+        """
+
+        self.FC_LS_IN_status.setStyleSheet(
+            "background-color: red; border-radius: 10px;"
+            if fc_ls_in == "1"
+            else "background-color: grey; border-radius: 10px;"
+        )
+        self.FC_LS_OUT_status.setStyleSheet(
+            "background-color: red; border-radius: 10px;"
+            if fc_ls_out == "1"
+            else "background-color: grey; border-radius: 10px;"
+        )
+        self.SL_LS_IN_status.setStyleSheet(
+            "background-color: red; border-radius: 10px;"
+            if sl_ls_in == "1"
+            else "background-color: grey; border-radius: 10px;"
+        )
+        self.SL_LS_OUT_status.setStyleSheet(
+            "background-color: red; border-radius: 10px;"
+            if sl_ls_out == "1"
+            else "background-color: grey; border-radius: 10px;"
+        )
+        self.SL_pos_field.setText(f"{pos} mm")
+
+    def _log_message(self, message: str) -> None:
+        """Add a message to the log display.
+
+        Args:
+            message: The message to log
+        """
         self.logs_field.append(message)
 
     # ================= Scan routine ================
-    def run_scan(self, start_field=None, end_field=None):
-        if not self.serial_thread.is_running:
-            self.log_message("Error: Not connected to COM port!")
+    def _run_scan(self, start_field=None, end_field=None) -> None:
+        """Run a scan between the specified positions.
+
+        Args:
+            start_field: The QLineEdit containing the start position
+            end_field: The QLineEdit containing the end position
+        """
+        if not self.serial_thread.isRunning():
+            self._log_message("Error: Not connected to COM port!")
             return
-        if self.keithley is None:
-            self.log_message("No connection to Keithley. Cannot start the scan")
+
+        if not self.keithley._resource:
+            self._log_message("No connection to Keithley. Cannot start the scan")
             return
+
         if self.is_scanning:
-            self.log_message("Scan already in progress.")
+            self._log_message("Scan already in progress.")
             return
+
         try:
             pos1 = float(start_field.text())
             pos2 = float(end_field.text())
         except ValueError:
-            self.log_message("Invalid scan positions.")
+            self._log_message("Invalid scan positions.")
             return
 
         self.scan_data = []
         self.is_scanning = True
         self._scan_interrupt = False
 
-        # Start scan in a thread
-        print("Started thread")
         threading.Thread(
-            target=self.scan_routine, args=(pos1, pos2), daemon=True
+            target=self._scan_routine, args=(pos1, pos2), daemon=True
         ).start()
 
-    def scan_cleanup(self):
-        """Cleanup after scan interruption or finish."""
-        print("Stopping...")
-        if self.is_scanning:
-            self.is_scanning = False
-            self._scan_interrupt = True
-            self._pos_reached_event.set()  # Unblock any wait for position
-            self._ack_event.set()  # Unblock any wait for ACK
-            self.serial_thread.write_data("SL_STOP\n")
-            self.serial_thread.write_data("SL_FR#800\n")
-            self.log_message("Scan stopped")
-        else:
-            self.log_message("Scan wasn't running")
+    def _cleanup_scan(self) -> None:
+        """Clean up after a scan completes or is interrupted."""
+        if not self.is_scanning:
+            self._log_message("Scan wasn't running")
+            return
 
-    def scan_routine(self, start, end):
+        self.is_scanning = False
+        self._scan_interrupt = True
+        self._pos_reached_event.set()  # Unblock any wait for position
+        self._ack_event.set()  # Unblock any wait for ACK
+
+        self._send_serial_command("SL_STOP\n")
+        self._send_serial_command("SL_FR#800\n")
+        self._log_message("Scan stopped")
+
+    def _scan_routine(self, start: float, end: float) -> None:
+        """The actual scan routine that runs in a separate thread.
+
+        Args:
+            start: Start position of the scan
+            end: End position of the scan
+        """
         try:
             normal_speed = 800
             scan_speed = 200
@@ -480,44 +549,46 @@ class DB_Main_Window(QMainWindow):
             # 1) Move to nearest boundary if not already there
             current_pos = self._scan_position
             if current_pos is None:
-                self.log_message("Current position unknown. Cannot start scan.")
+                self._log_message("Current position unknown. Cannot start scan.")
                 return
-            print("Current position ", current_pos)
 
             dist_to_start = abs(current_pos - start)
             dist_to_end = abs(current_pos - end)
             nearest = start if dist_to_start < dist_to_end else end
             farthest = end if nearest == start else start
 
-            self.serial_thread.write_data(f"SL_FR#{normal_speed}\n")
-            time.sleep(0.2)  # * do we need it?
+            self._send_serial_command(f"SL_FR#{normal_speed}\n")
+            time.sleep(0.2)
+
             self._pos_reached_event.clear()
             self._target_position = nearest
-            if abs(current_pos - nearest) > 0.5:
-                self.serial_thread.write_data(f"SL_TO#{nearest}\n")
-                self.log_message(f"Moving to nearest scan boundary: {nearest} mm")
-            else:
-                self.log_message(f"Already near scan boundary: {nearest} mm")
-                self._pos_reached_event.set()  # Already there
 
-            # 1.2) Wait until position is reached (with timeout)
+            if abs(current_pos - nearest) > 0.5:
+                self._send_serial_command(f"SL_TO#{nearest}\n")
+                self._log_message(f"Moving to nearest scan boundary: {nearest} mm")
+            else:
+                self._log_message(f"Already near scan boundary: {nearest} mm")
+                self._pos_reached_event.set()
+
+            # Wait until position is reached (with timeout)
             if not self._pos_reached_event.wait(timeout=60):
-                self.log_message("Timeout waiting for position.")
+                self._log_message("Timeout waiting for position.")
                 return
 
             # 2) Reduce speed for scan
-            self.serial_thread.write_data(f"SL_FR#{scan_speed}\n")
+            self._send_serial_command(f"SL_FR#{scan_speed}\n")
 
-            # 4) Start scan: move to farthest boundary
+            # 3) Start scan: move to farthest boundary
             direction = "SL_IN_BY" if farthest > nearest else "SL_OUT_BY"
             distance = abs(farthest - nearest)
-            self.serial_thread.write_data(f"{direction}#{distance}\n")
+            self._send_serial_command(f"{direction}#{distance}\n")
+
             self._ack_event.clear()
             if not self._ack_event.wait(timeout=5):
-                self.log_message("Timeout waiting for ACK from Arduino.")
+                self._log_message("Timeout waiting for ACK from Arduino.")
                 return
 
-            self.log_message(f"Scanning from {nearest} mm to {farthest} mm")
+            self._log_message(f"Scanning from {nearest} mm to {farthest} mm")
             scan_start_time = time.time()
 
             # Prepare lists for plotting
@@ -526,15 +597,13 @@ class DB_Main_Window(QMainWindow):
             currents = []
 
             while not self._scan_interrupt:
-                pos = self._scan_position  # ? Do I get a position like this??
+                pos = self._scan_position
                 sl_status = self._scan_sl_status
                 t = time.time() - scan_start_time
 
                 # Read current from Keithley
-                try:
-                    current = float(self.keithley.query(":READ?").split(",")[0].strip())
-                except Exception as e:
-                    print(f"Keithley read error: {str(e)}")
+                current = self.keithley.read_current()
+                if current is None:
                     current = float("nan")
 
                 self.scan_data.append((t, pos, current))
@@ -545,53 +614,30 @@ class DB_Main_Window(QMainWindow):
                 # Update plot in main thread
                 QMetaObject.invokeMethod(
                     self,
-                    lambda: self.update_scan_plot(positions, currents),
+                    lambda: self._update_scan_plot(positions, currents),
                     Qt.QueuedConnection,
                 )
 
-                # Check both position and sl_status
+                # Check if we've reached the target position
                 if pos is not None and abs(pos - farthest) < 0.5 and sl_status == "0":
                     break
 
-                time.sleep(0.2)  # Slow down polling
-            if self._scan_interrupt:
-                self.log_message("Scan interrupted by user.")
+                time.sleep(0.01)  # Prevent busy looping
+
         except Exception as e:
-            self.log_message(f"Scan error: {e}")
+            self._log_message(f"Scan error: {e}")
         finally:
-            self.scan_cleanup()
+            self._cleanup_scan()
 
     # =========================================
 
-    def save_scan_data(self):
-        """Prompt user to save scan data to a CSV file."""
-        if not self.scan_data:
-            self.log_message("No scan data to save.")
-            return
-        options = QFileDialog.Options()
-        filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Scan Data",
-            "",
-            "CSV Files (*.csv);;All Files (*)",
-            options=options,
-        )
-        if not filename:
-            self.log_message("Save cancelled.")
-            return
-        import csv
+    def _update_scan_plot(self, positions: List[float], currents: List[float]) -> None:
+        """Update the scan plot with new data.
 
-        try:
-            with open(filename, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["time_s", "position_mm", "current_A"])
-                writer.writerows(self.scan_data)
-            self.log_message(f"Scan data saved to {filename}")
-        except Exception as e:
-            self.log_message(f"Failed to save scan data: {e}")
-
-    def update_scan_plot(self, positions, currents):
-        """Update the scan plot with new data."""
+        Args:
+            positions: List of position values
+            currents: List of current values
+        """
         self.plotWidget.clear()
         pen = pg.mkPen(color=(0, 0, 255), width=1)
         self.plotWidget.plot(
@@ -600,9 +646,39 @@ class DB_Main_Window(QMainWindow):
         self.plotWidget.setLabel("left", "Current (A)")
         self.plotWidget.setLabel("bottom", "Slit position (mm)")
 
-    def closeEvent(self, event):
-        if self.serial_thread.is_running:
-            self.serial_thread.stop()
+    def _save_scan_data(self) -> None:
+        """Save the collected scan data to a CSV file."""
+        if not self.scan_data:
+            self._log_message("No scan data to save.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Scan Data",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+            options=QFileDialog.Options(),
+        )
+
+        if not filename:
+            self._log_message("Save cancelled.")
+            return
+
+        try:
+            with open(filename, "w", newline="") as f:
+                import csv
+
+                writer = csv.writer(f)
+                writer.writerow(["time_s", "position_mm", "current_A"])
+                writer.writerows(self.scan_data)
+            self._log_message(f"Scan data saved to {filename}")
+        except Exception as e:
+            self._log_message(f"Failed to save scan data: {e}")
+
+    def closeEvent(self, event) -> None:
+        """Handle window close event."""
+        self.serial_thread.stop()
+        self.keithley.disconnect()
         event.accept()
 
 
