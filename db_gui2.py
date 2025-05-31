@@ -1,12 +1,14 @@
 import sys
-from PyQt5 import uic
-from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot
+import time
+import threading
 from queue import Queue
+from typing import Optional, Tuple, List
+
+import serial
 import serial.tools.list_ports
 import pyvisa
-import threading
-import time
-
+import pyqtgraph as pg
+from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot, QMetaObject, Qt
 from PyQt5.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -19,11 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
 )
-import pyqtgraph as pg
-from pyqtgraph import PlotWidget, plot
-
-# --- Update plot in main thread ---
-from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+from PyQt5 import uic
 
 
 class SerialThread(QThread):
@@ -37,51 +35,83 @@ class SerialThread(QThread):
     def __init__(self, parent):
         super().__init__(parent)
         self.ser = None
-        self.is_running = False
-        self.write_queue = Queue()
+        self._is_running = False
+        self._write_queue = Queue()
+        self._lock = threading.Lock()
 
     def setup_port(self, port_name: str, baud_rate: int):
+        """Initialize the serial port connection.
+
+        Args:
+            port_name: Name of the serial port (e.g., 'COM3')
+            baud_rate: Baud rate for communication
+
+        Returns:
+            bool: True if connection was successful, False otherwise
+        """
         try:
-            self.ser = serial.Serial(port_name, baud_rate, timeout=1)
-            self.is_running = True
+            with self._lock:
+                self.ser = serial.Serial(port_name, baud_rate, timeout=1)
+                self._is_running = True
+            return True
         except serial.SerialException as e:
-            # print(f"Error opening serial port: {e}")
             self.error_occurred.emit(f"Error opening serial port: {e}")
+            return False
 
     def run(self):
+        """Main thread loop for handling serial communication."""
         while self.is_running and self.ser and self.ser.is_open:
-            # Handle writing
-            while not self.write_queue.empty():
-                data = self.write_queue.get()
-                self.ser.write(data)
-                self.ser.flush()
-
-            # Handle reading
-            if self.ser.in_waiting:
-                data = self.ser.readline().decode(errors="ignore").strip()
-                self.received_data.emit(data)
-        if self.ser:
+            with self._lock:
+                # Handle writing
+                while not self._write_queue.empty():
+                    data = self._write_queue.get()
+                    try:
+                        self.ser.write(data)
+                        self.ser.flush()
+                    except serial.SerialException as e:
+                        self.error_occurred.emit(f"Write error: {e}")
+                        break
+                # Handle reading
+                try:
+                    if self.ser.in_waiting:
+                        data = self.ser.readline().decode(errors="ignore").strip()
+                        if data:
+                            self.received_data.emit(data)
+                except serial.SerialException as e:
+                    self.error_occurred.emit(f"Read error: {e}")
+                    break
+            time.sleep(0.01)  # Small delay to prevent busy looping
+        if self.ser and self.ser.is_open:  # Not actually sure what and why...
             self.ser.close()
 
     def stop(self) -> None:
-        """
-        Stop the thread and close the serial port.
-        """
-        self.is_running = False
-        if self.ser:
-            self.ser.close()
+        """Safely stop the thread and close the serial port."""
+        with self._lock:
+            self._is_running = False
+            if self.ser and self.ser.is_open:
+                self.ser.close()
         self.quit()
-        self.wait()
+        self.wait(1000)  # Wait up to 1 second for thread to finish
 
-    def write_data(self, data: str) -> None:
+    def write_data(self, data: str) -> bool:
+        """Write queue data to the serial port.
+
+        Args:
+            data: String data to send
+
+        Returns:
+            bool: True if data was queued successfully, False otherwise
         """
-        Queue data to be written to the serial port.
-        """
-        if self.ser and self.ser.is_open:
-            self.write_queue.put(data.encode())
-            print(f"Sent: {data}")
-        else:
-            self.error_occurred.emit("Serial port is not open")
+        with self._lock:
+            if not self.ser or not self.ser.is_open:
+                self.error_occurred.emit("Serial port is not open")
+                return False
+            try:
+                self._write_queue.put(data.encode())
+                return True
+            except Exception as e:
+                self.error_occurred.emit(f"Error queuing data: {e}")
+                return False
 
 
 class ConnectionDialog(QDialog):
