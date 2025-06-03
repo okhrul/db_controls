@@ -2,13 +2,13 @@ import sys
 import time
 import threading
 from queue import Queue
-from typing import Optional, Tuple, List
+from typing import Optional, List
 
 import serial
 import serial.tools.list_ports
 import pyvisa
 import pyqtgraph as pg
-from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot, QMetaObject, Qt
+from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -22,6 +22,11 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 from PyQt5 import uic
+
+NORMAL_SPEED = 800  # Hz
+DEFAULT_SCAN_SPEED = 150  # Hz
+REACHED_POSITION_TIMEOUT = 60  # s
+UPDATE_INTERVAL = 0.2  # s - has to match arduino
 
 
 class SerialThread(QThread):
@@ -53,7 +58,6 @@ class SerialThread(QThread):
             with self._lock:
                 self.ser = serial.Serial(port_name, baud_rate, timeout=1)
                 self._is_running = True
-                print("Set up serial, _is_running_=True")
             return True
         except serial.SerialException as e:
             self.error_occurred.emit(f"Error opening serial port: {e}")
@@ -76,6 +80,7 @@ class SerialThread(QThread):
                 try:
                     if self.ser.in_waiting:
                         data = self.ser.readline().decode(errors="ignore").strip()
+                        # self.ser.reset_input_buffer()
                         if data:
                             self.received_data.emit(data)
                 except serial.SerialException as e:
@@ -211,41 +216,39 @@ class KeithleyController:
             return None
 
         try:
-            return float(self._resource.query(":READ?").split(",")[0].strip())
+            return float(self._resource.query(":READ?").split(",")[0][:-1])
         except Exception as e:
             print(f"Keithley read error: {str(e)}")
             return None
 
 
 class DB_Main_Window(QMainWindow):
-    def __init__(self):
+    update_plot_signal = pyqtSignal(list, list)
+
+    def __init__(self, testing=False):
+        self.testing = testing
         super().__init__()
         uic.loadUi("db_gui2.ui", self)
         self.SL_pos_field.setToolTip("0 mm - OUT, 123 mm - IN")
         self._init_menu_bar()
         self._init_components()
         self._setup_functions()
+        self._setup_plot()
         self._init_scan_state()
 
-    # def _setup_plot(self) -> None:
-    #     """Configure the initial plot settings."""
-    #     self.plotWidget.setBackground("w")
-    #     self.plotWidget.clear()
-    #     pen = pg.mkPen(color=(0, 0, 255), width=1)
-    #     time_data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    #     temperature_data = [30, 32, 34, 32, 33, 31, 29, 32, 35, 45]
-    #     self.plotWidget.plot(
-    #         time_data, temperature_data,
-    #         symbol="o", symbolSize=6, symbolBrush="b", pen=pen
-    #     )
-    #     self.plotWidget.setLabel("left", "Current (A)")
-    #     self.plotWidget.setLabel("bottom", "Slit position (mm)")
+    def _setup_plot(self) -> None:
+        """Configure the initial plot settings."""
+        self.plotWidget.setBackground("w")
+        self.plotWidget.clear()
+        self.plotWidget.setLabel("left", "Current (A)")
+        self.plotWidget.setLabel("bottom", "Slit position (mm)")
 
     def _init_components(self) -> None:
         """Initialize thread and ampermeter"""
         self.serial_thread = SerialThread(self)
         self.serial_thread.received_data.connect(self._handle_received_data)
         self.serial_thread.error_occurred.connect(self._log_message)
+        self.update_plot_signal.connect(self._update_scan_plot)
 
         self.keithley = KeithleyController()
 
@@ -287,11 +290,15 @@ class DB_Main_Window(QMainWindow):
 
         # Scan buttons
         self.hStartScanBtn.clicked.connect(
-            lambda: self._run_scan(self.hStartPosField, self.hEndPosField)
+            lambda: self._run_scan(
+                self.hStartPosField, self.hEndPosField, self.slitScanSpeedFiled
+            )
         )
         self.hStopScanBtn.clicked.connect(self._cleanup_scan)
         self.vStartScanBtn.clicked.connect(
-            lambda: self._run_scan(self.vStartPosField, self.vEndPosField)
+            lambda: self._run_scan(
+                self.vStartPosField, self.vEndPosField, self.slitScanSpeedFiled
+            )
         )
         self.vStopScanBtn.clicked.connect(self._cleanup_scan)
 
@@ -486,7 +493,7 @@ class DB_Main_Window(QMainWindow):
         self.logs_field.append(message)
 
     # ================= Scan routine ================
-    def _run_scan(self, start_field=None, end_field=None) -> None:
+    def _run_scan(self, start_field=None, end_field=None, speed_field=None) -> None:
         """Run a scan between the specified positions.
 
         Args:
@@ -512,12 +519,18 @@ class DB_Main_Window(QMainWindow):
             self._log_message("Invalid scan positions.")
             return
 
+        try:
+            scan_speed = int(speed_field.text())
+        except ValueError:
+            self._log_message(f"Invalid speed. Setting {DEFAULT_SCAN_SPEED}Hz")
+            scan_speed = DEFAULT_SCAN_SPEED
+
         self.scan_data = []
         self.is_scanning = True
         self._scan_interrupt = False
-
+        # TODO: use qthread
         threading.Thread(
-            target=self._scan_routine, args=(pos1, pos2), daemon=True
+            target=self._scan_routine, args=(pos1, pos2, scan_speed), daemon=True
         ).start()
 
     def _cleanup_scan(self) -> None:
@@ -535,7 +548,7 @@ class DB_Main_Window(QMainWindow):
         self._send_serial_command("SL_FR#800\n")
         self._log_message("Scan stopped")
 
-    def _scan_routine(self, start: float, end: float) -> None:
+    def _scan_routine(self, start: float, end: float, scan_speed: int) -> None:
         """The actual scan routine that runs in a separate thread.
 
         Args:
@@ -543,9 +556,6 @@ class DB_Main_Window(QMainWindow):
             end: End position of the scan
         """
         try:
-            normal_speed = 800
-            scan_speed = 200
-
             # 1) Move to nearest boundary if not already there
             current_pos = self._scan_position
             if current_pos is None:
@@ -557,7 +567,7 @@ class DB_Main_Window(QMainWindow):
             nearest = start if dist_to_start < dist_to_end else end
             farthest = end if nearest == start else start
 
-            self._send_serial_command(f"SL_FR#{normal_speed}\n")
+            self._send_serial_command(f"SL_FR#{NORMAL_SPEED}\n")
             time.sleep(0.2)
 
             self._pos_reached_event.clear()
@@ -571,9 +581,10 @@ class DB_Main_Window(QMainWindow):
                 self._pos_reached_event.set()
 
             # Wait until position is reached (with timeout)
-            if not self._pos_reached_event.wait(timeout=60):
+            if not self._pos_reached_event.wait(timeout=REACHED_POSITION_TIMEOUT):
                 self._log_message("Timeout waiting for position.")
                 return
+            #! self._pos_reached_event.clear()
 
             # 2) Reduce speed for scan
             self._send_serial_command(f"SL_FR#{scan_speed}\n")
@@ -612,17 +623,13 @@ class DB_Main_Window(QMainWindow):
                 currents.append(current)
 
                 # Update plot in main thread
-                QMetaObject.invokeMethod(
-                    self,
-                    lambda: self._update_scan_plot(positions, currents),
-                    Qt.QueuedConnection,
-                )
+                self.update_plot_signal.emit(positions, currents)
 
                 # Check if we've reached the target position
                 if pos is not None and abs(pos - farthest) < 0.5 and sl_status == "0":
                     break
 
-                time.sleep(0.01)  # Prevent busy looping
+                time.sleep(UPDATE_INTERVAL)  # Has to match arduino
 
         except Exception as e:
             self._log_message(f"Scan error: {e}")
