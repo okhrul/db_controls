@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
 )
-from PyQt5 import uic
+from PyQt5 import uic, QtGui
 
 NORMAL_SPEED = 800  # Hz
 DEFAULT_SCAN_SPEED = 150  # Hz
@@ -241,7 +241,7 @@ class DB_Main_Window(QMainWindow):
         self.plotWidget.setBackground("w")
         self.plotWidget.clear()
         self.plotWidget.setLabel("left", "Current (A)")
-        self.plotWidget.setLabel("bottom", "Slit position (mm)")
+        self.plotWidget.setLabel("bottom", "Relative position (mm)")
 
     def _init_components(self) -> None:
         """Initialize thread and ampermeter"""
@@ -291,16 +291,24 @@ class DB_Main_Window(QMainWindow):
         # Scan buttons
         self.hStartScanBtn.clicked.connect(
             lambda: self._run_scan(
-                self.hStartPosField, self.hEndPosField, self.slitScanSpeedFiled
+                self.hStartPosField,
+                self.hEndPosField,
+                self.hCenterField,
+                self.slitScanSpeedFiled,
             )
         )
         self.hStopScanBtn.clicked.connect(self._cleanup_scan)
         self.vStartScanBtn.clicked.connect(
             lambda: self._run_scan(
-                self.vStartPosField, self.vEndPosField, self.slitScanSpeedFiled
+                self.vStartPosField,
+                self.vEndPosField,
+                self.vCenterField,
+                self.slitScanSpeedFiled,
             )
         )
         self.vStopScanBtn.clicked.connect(self._cleanup_scan)
+        # Fit profile with gaussian
+        self.fitGausBtn.clicked.connect(self.fit_gaussian)
 
         # Data saving
         self.saveBtn.clicked.connect(self._save_scan_data)
@@ -491,14 +499,18 @@ class DB_Main_Window(QMainWindow):
             message: The message to log
         """
         self.logs_field.append(message)
+        self.logs_field.moveCursor(QtGui.QTextCursor.End) #auto scroll down
 
     # ================= Scan routine ================
-    def _run_scan(self, start_field=None, end_field=None, speed_field=None) -> None:
+    def _run_scan(
+        self, start_field=None, end_field=None, center_field=None, speed_field=None
+    ) -> None:
         """Run a scan between the specified positions.
 
         Args:
             start_field: The QLineEdit containing the start position
             end_field: The QLineEdit containing the end position
+            center_field: The QLineEdit containing slit center (for relative plotting)
         """
         if not self.serial_thread.isRunning():
             self._log_message("Error: Not connected to COM port!")
@@ -515,6 +527,7 @@ class DB_Main_Window(QMainWindow):
         try:
             pos1 = float(start_field.text())
             pos2 = float(end_field.text())
+            center = float(center_field.text())
         except ValueError:
             self._log_message("Invalid scan positions.")
             return
@@ -528,9 +541,13 @@ class DB_Main_Window(QMainWindow):
         self.scan_data = []
         self.is_scanning = True
         self._scan_interrupt = False
+        # Clear screen when started new scan
+        self.plotWidget.clear()
         # TODO: use qthread
         threading.Thread(
-            target=self._scan_routine, args=(pos1, pos2, scan_speed), daemon=True
+            target=self._scan_routine,
+            args=(pos1, pos2, center, scan_speed),
+            daemon=True,
         ).start()
 
     def _cleanup_scan(self) -> None:
@@ -548,7 +565,9 @@ class DB_Main_Window(QMainWindow):
         self._send_serial_command("SL_FR#800\n")
         self._log_message("Scan stopped")
 
-    def _scan_routine(self, start: float, end: float, scan_speed: int) -> None:
+    def _scan_routine(
+        self, start: float, end: float, slit_center: float, scan_speed: int
+    ) -> None:
         """The actual scan routine that runs in a separate thread.
 
         Args:
@@ -567,6 +586,8 @@ class DB_Main_Window(QMainWindow):
             nearest = start if dist_to_start < dist_to_end else end
             farthest = end if nearest == start else start
 
+            # self.plotWidget.setXRange(nearest - slit_center, farthest - slit_center)
+        
             self._send_serial_command(f"SL_FR#{NORMAL_SPEED}\n")
             time.sleep(0.2)
 
@@ -604,11 +625,12 @@ class DB_Main_Window(QMainWindow):
 
             # Prepare lists for plotting
             times = []
-            positions = []
+            slit_positions = []
+            shifted_positions = []
             currents = []
 
             while not self._scan_interrupt:
-                pos = self._scan_position
+                slit_pos = self._scan_position
                 sl_status = self._scan_sl_status
                 t = time.time() - scan_start_time
 
@@ -617,16 +639,23 @@ class DB_Main_Window(QMainWindow):
                 if current is None:
                     current = float("nan")
 
-                self.scan_data.append((t, pos, current))
+                self.scan_data.append((t, slit_pos, slit_pos - slit_center, current))
                 times.append(t)
-                positions.append(pos)
+                slit_positions.append(slit_pos)
+                shifted_positions.append(slit_pos - slit_center)
                 currents.append(current)
 
-                # Update plot in main thread
-                self.update_plot_signal.emit(positions, currents)
-
+                # Update plot in main thread                # Update plot in main thread
+                try:
+                    self.update_plot_signal.emit(shifted_positions, currents)
+                except Exception as e:
+                    print(f"Failed to update plot: {e}")
                 # Check if we've reached the target position
-                if pos is not None and abs(pos - farthest) < 0.5 and sl_status == "0":
+                if (
+                    slit_pos is not None
+                    and abs(slit_pos - farthest) < 0.5
+                    and sl_status == "0"
+                ):
                     break
 
                 time.sleep(UPDATE_INTERVAL)  # Has to match arduino
@@ -637,7 +666,7 @@ class DB_Main_Window(QMainWindow):
             self._cleanup_scan()
 
     # =========================================
-
+    @pyqtSlot(list, list)
     def _update_scan_plot(self, positions: List[float], currents: List[float]) -> None:
         """Update the scan plot with new data.
 
@@ -652,6 +681,63 @@ class DB_Main_Window(QMainWindow):
         )
         self.plotWidget.setLabel("left", "Current (A)")
         self.plotWidget.setLabel("bottom", "Slit position (mm)")
+
+    def fit_gaussian(self):
+        """Gaussian fit of obtained profile"""
+        if self.is_scanning:
+            self._log_message("Cannot fit during active scan - stop scan first.")
+            return
+        if not hasattr(self, "scan_data") or len(self.scan_data) < 10:
+            self._log_message("Not enough data points for fitting")
+            return
+
+        # Define the Gaussian function
+        def gaussian(x, a, x0, sigma):
+            return a * np.exp(-((x - x0) ** 2) / (2 * sigma**2))
+
+        try:
+            import numpy as np
+            from scipy.optimize import curve_fit
+
+            rel_positions = np.array([p[2] for p in self.scan_data])
+            currents = np.array([p[3] for p in self.scan_data])
+            # Data validation
+            valid = np.isfinite(currents)
+            positions = rel_positions[valid]
+            currents = currents[valid]
+
+            # Maybe define some bounds and baseline...
+            initial_guess = [max(currents), 0, 1]
+            popt, pcov = curve_fit(gaussian, positions, currents, p0=initial_guess)
+            amplitude, mean, sigma = popt
+            # Calculate fitted curve
+            fit_x = np.linspace(min(positions), max(positions), 100)
+            fit_y = gaussian(fit_x, *popt)
+            # Plot the fit
+            self.plotWidget.plot(fit_x, fit_y, pen=pg.mkPen("r", width=2,), name="Gaussian fit")
+            # Add vertical line at mean
+            vline = pg.InfiniteLine(pos=mean, angle=90, pen=pg.mkPen('k', style=pg.QtCore.Qt.DashLine))
+            self.plotWidget.addItem(vline)
+            # center_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(style=pg.QtCore.Qt.DashLine))
+            # self.plotWidget.addItem(center_line)
+            # Add fit info
+            fit_text = f"Beam center: {mean:.2f} mm\n±3σ beam size: {6*sigma:.2f} mm"
+            text_item = pg.TextItem(fit_text, anchor=(1,0), color='k')
+            # Get the current view box limits to position the text
+            vb = self.plotWidget.getViewBox()
+            x_range, y_range = vb.viewRange()
+            x_pos = x_range[1] - 0.05 * (x_range[1] - x_range[0])  # a bit left of right edge
+            y_pos = y_range[1] - 0.05 * (y_range[1] - y_range[0])  # a bit below top edge
+            # Position and add the text
+            text_item.setPos(x_pos, y_pos)
+            self.plotWidget.addItem(text_item)
+            # Plot lines for beam size
+            self.plotWidget.plot([mean-3*sigma, mean+3*sigma], [amplitude/40, amplitude/40], pen=pg.mkPen(width=1, style=pg.QtCore.Qt.DashLine,))
+            self.plotWidget.plot([mean-3*sigma, mean-3*sigma], [0, amplitude/20], pen=pg.mkPen(style=pg.QtCore.Qt.DashLine, width=1))
+            self.plotWidget.plot([mean+3*sigma, mean+3*sigma], [0, amplitude/20], pen=pg.mkPen( style=pg.QtCore.Qt.DashLine, width=1))
+
+        except Exception as e:
+            self._log_message(f"Fit failed: {str(e)}")
 
     def _save_scan_data(self) -> None:
         """Save the collected scan data to a CSV file."""
@@ -676,7 +762,9 @@ class DB_Main_Window(QMainWindow):
                 import csv
 
                 writer = csv.writer(f)
-                writer.writerow(["time_s", "position_mm", "current_A"])
+                writer.writerow(
+                    ["time_s", "slit_position_mm", "rel_position_mm", "current_A"]
+                )
                 writer.writerows(self.scan_data)
             self._log_message(f"Scan data saved to {filename}")
         except Exception as e:
