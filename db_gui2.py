@@ -680,7 +680,7 @@ class DB_Main_Window(QMainWindow):
             positions, currents, symbol="o", symbolSize=6, symbolBrush="b", pen=pen
         )
         self.plotWidget.setLabel("left", "Current (A)")
-        self.plotWidget.setLabel("bottom", "Slit position (mm)")
+        self.plotWidget.setLabel("bottom", "Relative position (mm)")
 
     def fit_gaussian(self):
         """Gaussian fit of obtained profile"""
@@ -718,8 +718,8 @@ class DB_Main_Window(QMainWindow):
             # Add vertical line at mean
             vline = pg.InfiniteLine(pos=mean, angle=90, pen=pg.mkPen('k', style=pg.QtCore.Qt.DashLine))
             self.plotWidget.addItem(vline)
-            # center_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(style=pg.QtCore.Qt.DashLine))
-            # self.plotWidget.addItem(center_line)
+            center_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(style=pg.QtCore.Qt.DashLine))
+            self.plotWidget.addItem(center_line)
             # Add fit info
             fit_text = f"Beam center: {mean:.2f} mm\n±3σ beam size: {6*sigma:.2f} mm"
             text_item = pg.TextItem(fit_text, anchor=(1,0), color='k')
